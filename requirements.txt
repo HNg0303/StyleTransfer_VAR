@@ -1,8 +1,9 @@
 torch~=2.1.0
 
+torchvision==0.16.0
 Pillow
 huggingface_hub
 numpy
 pytz
-transformers
+transformers==4.35.2
 typed-argument-parser
