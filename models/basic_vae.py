@@ -10,15 +10,17 @@ __all__ = ['Encoder', 'Decoder',]
 """
 References: https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/ldm/modules/diffusionmodules/model.py
 """
-# swish
+# SWISH FUNCTION: SiLU (Sigmoid Linear Unit) -> The multiplicative combination of the input and the sigmoid of the input.
+# SiLU has a smooth curve and is differentiable, which can help with gradient flow during training. It has been shown to perform better than ReLU in some cases, especially in deep networks.
+# Non-monotonicity: Unlike ReLU, which is monotonic, SiLU is non-monotonic. This means that it can produce negative outputs for negative inputs, which can help the network learn more complex functions, while ReLU simply outputs zero for negative inputs. This can be beneficial in certain scenarios where the model needs to capture more nuanced relationships in the data.
 def nonlinearity(x):
     return x * torch.sigmoid(x)
 
-
+# Group Normalization: Normalize by H x W (Spatial Dimension) in the same batch N and Channel defined by group -> Number of channels groups in a batch size by C / G.
 def Normalize(in_channels, num_groups=32):
     return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
 
-
+# Upsample by 2x: Using interpolate 2x scale with nearest neighbor mode: Upscale image with the nearest pixel to the current pixel.
 class Upsample2x(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -27,7 +29,7 @@ class Upsample2x(nn.Module):
     def forward(self, x):
         return self.conv(F.interpolate(x, scale_factor=2, mode='nearest'))
 
-
+# Downsample: Downsample on spatial dimension using stride=2 convolution with kernel size 3.
 class Downsample2x(nn.Module):
     def __init__(self, in_channels):
         super().__init__()

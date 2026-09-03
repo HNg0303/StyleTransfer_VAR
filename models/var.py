@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
@@ -30,7 +30,11 @@ class VAR(nn.Module):
         super().__init__()
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
+
+        ## 0.a Define the embedding size of codebook (CVae) and Vocabulary Size of codebook.
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
+
+        ## 0.b. Depth: Number of AdaLNAttention blocks in the AR model.
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
         
         self.cond_drop_rate = cond_drop_rate
@@ -52,9 +56,9 @@ class VAR(nn.Module):
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
-        self.word_embed = nn.Linear(self.Cvae, self.C)
+        self.word_embed = nn.Linear(self.Cvae, self.C) # Linear Projection from codebook embedding to VAR embedding
         
-        # 2. class embedding
+        # 2. class embedding: Content-specific generation and class embedding as the start token -> conditional embedding.
         init_std = math.sqrt(1 / self.C / 3)
         self.num_classes = num_classes
         self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
@@ -113,7 +117,7 @@ class VAR(nn.Module):
         
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
-        self.head = nn.Linear(self.C, self.V)
+        self.head = nn.Linear(self.C, self.V) # Linear projection from VAR embedding to codebook vocabulary logits.
     
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
@@ -127,7 +131,7 @@ class VAR(nn.Module):
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False,
+        more_smooth=False, content_ls_idxBI: Optional[List[torch.LongTensor]] = None
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -138,6 +142,7 @@ class VAR(nn.Module):
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :param content_ls_idxBI: list of content image indices for each resolution scale; if None, no content image is used #Add new
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
         if g_seed is None: rng = None
@@ -148,10 +153,13 @@ class VAR(nn.Module):
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0)) # B x C
         
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC # Level n: the nxn resolution that token belongs to and spatial position (exact i, j in h,w). 
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        print(f"next_token_map.shape: {next_token_map.shape}")
+        print(f"lvl_pos[:, :self.first_l].shape: {lvl_pos[:, :self.first_l].shape}")
+        print(f"self.pos_start.expand(2 * B, self.first_l, -1).shape: {self.pos_start.expand(2 * B, self.first_l, -1).shape}")
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
@@ -180,7 +188,7 @@ class VAR(nn.Module):
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw, content_idxBI=content_ls_idxBI)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]

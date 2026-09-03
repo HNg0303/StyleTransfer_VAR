@@ -31,6 +31,7 @@ except ImportError:
 
 
 class FFN(nn.Module):
+    # Feed Forward Network: If fused_MLP_func is available, use that layer (Multi-Layer Perceptrons) with weights and biases initialized by 
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0., fused_if_available=True):
         super().__init__()
         self.fused_mlp_func = fused_mlp_func if fused_if_available else None
@@ -56,6 +57,10 @@ class FFN(nn.Module):
 
 
 class SelfAttention(nn.Module):
+    """
+    Self-Attention Module: Conduct Multi-head Self-Attention Mechanism Block with embedding dimension 768.
+    Divide embedding dimension by num_heads -> Each attention head 
+    """
     def __init__(
         self, block_idx, embed_dim=768, num_heads=12,
         attn_drop=0., proj_drop=0., attn_l2_norm=False, flash_if_available=True,
@@ -72,11 +77,11 @@ class SelfAttention(nn.Module):
             self.scale = 0.25 / math.sqrt(self.head_dim)
         
         self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim)) # Shape of bias is: (E, 1)
         self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
         
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.proj_drop = nn.Dropout(proj_drop, inplace=True) if proj_drop > 0 else nn.Identity()
+        self.proj = nn.Linear(embed_dim, embed_dim) # Linear Projection.
+        self.proj_drop = nn.Dropout(proj_drop, inplace=True) if proj_drop > 0 else nn.Identity() # Dropout Layer for avoiding overfitting.
         self.attn_drop: float = attn_drop
         self.using_flash = flash_if_available and flash_attn_func is not None
         self.using_xform = flash_if_available and memory_efficient_attention is not None

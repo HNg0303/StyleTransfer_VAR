@@ -19,8 +19,8 @@ class VectorQuantizer2(nn.Module):
         default_qresi_counts=0, v_patch_nums=None, quant_resi=0.5, share_quant_resi=4,  # share_quant_resi: args.qsr
     ):
         super().__init__()
-        self.vocab_size: int = vocab_size
-        self.Cvae: int = Cvae
+        self.vocab_size: int = vocab_size # Vocabulary Size
+        self.Cvae: int = Cvae # The number of channels in the latent space (embedding dimension)
         self.using_znorm: bool = using_znorm
         self.v_patch_nums: Tuple[int] = v_patch_nums
         
@@ -35,8 +35,8 @@ class VectorQuantizer2(nn.Module):
         self.register_buffer('ema_vocab_hit_SV', torch.full((len(self.v_patch_nums), self.vocab_size), fill_value=0.0))
         self.record_hit = 0
         
-        self.beta: float = beta
-        self.embedding = nn.Embedding(self.vocab_size, self.Cvae)
+        self.beta: float = beta # Define as the commitment loss coefficient, which is used to control the strength of the commitment loss term in the VQ-VAE training process.
+        self.embedding = nn.Embedding(self.vocab_size, self.Cvae) # Initialize a learnable codebook with number of vocabulary as vocab_size and embedding size as CVae.
         
         # only used for progressive training of VAR (not supported yet, will be tested and supported in the future)
         self.prog_si = -1   # progressive training: not supported yet, prog_si always -1
@@ -50,24 +50,35 @@ class VectorQuantizer2(nn.Module):
     
     # ===================== `forward` is only used in VAE training =====================
     def forward(self, f_BChw: torch.Tensor, ret_usages=False) -> Tuple[torch.Tensor, List[float], torch.Tensor]:
+        # Input is f_BChw, the feature map from the encoder, with shape (B, C, H, W)
         dtype = f_BChw.dtype
         if dtype != torch.float32: f_BChw = f_BChw.float()
+
+        # Take out shape of the input f_BChw and detach from network graph to f_no_grad.
         B, C, H, W = f_BChw.shape
-        f_no_grad = f_BChw.detach()
+        f_no_grad = f_BChw.detach() # Detach will free all gradients from the tensor so that it will not be updated during backpropagation.
         
-        f_rest = f_no_grad.clone()
-        f_hat = torch.zeros_like(f_rest)
+        f_rest = f_no_grad.clone() # Clone the f_no_grad to f_rest.
+        f_hat = torch.zeros_like(f_rest) # Create a tensor of zeros with the same shape as f_rest to store the reconstructed feature map.
         
         with torch.cuda.amp.autocast(enabled=False):
-            mean_vq_loss: torch.Tensor = 0.0
+            mean_vq_loss: torch.Tensor = 0.0 # Initialize the mean vector quantization loss to zero.
             vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=f_BChw.device)
-            SN = len(self.v_patch_nums)
-            for si, pn in enumerate(self.v_patch_nums): # from small to large
+            SN = len(self.v_patch_nums) # Number of resolution scales, which is the length of the v_patch_nums list.
+            for si, pn in enumerate(self.v_patch_nums): # from small to large resolution scales. Each has a tuple of (patch_size, num_patches).
                 # find the nearest embedding
                 if self.using_znorm:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-                    rest_NC = F.normalize(rest_NC, dim=-1)
-                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)
+                    # If using z-normalization, interpolate the f_rest to the current patch size (pn, pn) and reshape it to (B*pn*pn, C). 
+                    # If it's the last scale, just reshape f_rest without interpolation. Then normalize the rest_NC tensor along the last dimension.
+                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C) # Shape: (B*pn*pn, C)
+
+                    # Normalize across the last dimension -> Normalize the tensor across all channels for each value in B*pn*pn.
+                    rest_NC = F.normalize(rest_NC, dim=-1) 
+
+                    # Take the index of the maximum value along the last dimension of the dot product between rest_NC and the normalized embedding weights. This gives the index of the nearest embedding for each patch.
+                    # Embedding is of embedding shape (V, C) ^ T -> shape (C, V) and normalize across the embedding dim for each vocabulary.
+                    # Dot Product between the input feature -> (B*pn*pn, V) -> Taking argmax on dim = 1 (Vocab Dim) -> gives the index of the nearest embedding in the vocabulary for each patch.
+                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1) # -> Index N has the shape of (B*pn*pn,) value is the index of the embedding that is neareast to the ith patch in the input feature map.
                 else:
                     rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
                     d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
@@ -79,10 +90,18 @@ class VectorQuantizer2(nn.Module):
                     if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # calc loss
-                idx_Bhw = idx_N.view(B, pn, pn)
+                idx_Bhw = idx_N.view(B, pn, pn) # index N size is (B*pn*pn) -> Reshape back to (B, pn, pn).  
+
+                # take the embedding and reshape to (B, C, pn, pn) -> Interpolate back to (B, C , H, W)  if the resolution is not the maximum resolution.
                 h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
-                f_hat = f_hat + h_BChw
+
+                # Quantized Residual Block: 
+                h_BChw = self.quant_resi[si/(SN-1)](h_BChw) 
+
+                # Add up gradually for each embedding learned from different solution: f_hat = f_1 + f_2 + f_3 + ... f_n for n is the number of index in the resolution list.
+                f_hat = f_hat + h_BChw 
+
+                # Record the rest that is not yet embedded and continue on the rest of resolution maps.
                 f_rest -= h_BChw
                 
                 if self.training and dist.initialized():
@@ -92,9 +111,16 @@ class VectorQuantizer2(nn.Module):
                     else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01))
                     self.record_hit += 1
                 vocab_hit_V.add_(hit_V)
+
+                # Codebook Loss + Commitment Loss: 
+                ## Codebook Loss: Use stop-gradient on f_hat which is the embedding of input feature f_BChw
                 mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
-            
+
+            #Take the mean over all resolution.
             mean_vq_loss *= 1. / SN
+
+            # Straight-through Gradient Estimator: Provide quantized feature map to the forward pass and ensure gradient flow for the backward pass. The reason is the quantized function is not differentiable and could be zero 
+            # Thus provide a Straight-Through Estimator like q_hat = sg(q - z) + z. For forward pass, it is q -> quantized feature map. For backward pass, sg() has no gradient -> Thus the gradient is flow through z. (Input feature map)
             f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
         
         margin = tdist.get_world_size() * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08
@@ -105,6 +131,7 @@ class VectorQuantizer2(nn.Module):
     # ===================== `forward` is only used in VAE training =====================
     
     def embed_to_fhat(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale=True, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
+        #### This function takes a list of multi-scale feature maps (embedding) (ms_h_BChw) and reconstructs the final feature map (f_hat) by combining them.
         ls_f_hat_BChw = []
         B = ms_h_BChw[0].shape[0]
         H = W = self.v_patch_nums[-1]
@@ -132,11 +159,12 @@ class VectorQuantizer2(nn.Module):
         
         return ls_f_hat_BChw
     
-    def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
+    def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  
+        # f_BChw is the feature map from the encoder, with shape (B, C, H, W).
         B, C, H, W = f_BChw.shape
-        f_no_grad = f_BChw.detach()
-        f_rest = f_no_grad.clone()
-        f_hat = torch.zeros_like(f_rest)
+        f_no_grad = f_BChw.detach() # Detach will free all gradients from the tensor so that it will not be updated during backpropagation.
+        f_rest = f_no_grad.clone()  # Clone the f_no_grad to f_rest -> This will be used to store the remaining feature map after each embedding is found and subtracted from the original feature map.
+        f_hat = torch.zeros_like(f_rest) # Create a tensor of zeros with the same shape as f_rest to store the reconstructed feature map.
         
         f_hat_or_idx_Bl: List[torch.Tensor] = []
         
@@ -161,9 +189,9 @@ class VectorQuantizer2(nn.Module):
             h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h_BChw)
             f_rest.sub_(h_BChw)
-            f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw))
+            f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw)) # Idx_N is reshpaped to (B, ph*pw) for each resolution scale, where ph and pw are the height and width of the feature map at that scale.
         
-        return f_hat_or_idx_Bl
+        return f_hat_or_idx_Bl # Return list of tensors of either reconstructed feature maps (f_hat) or indices (idx_Bl) for each resolution scale, depending on the boolean value of to_fhat.
     
     # ===================== idxBl_to_var_input: only used in VAR training, for getting teacher-forcing input =====================
     def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
@@ -184,14 +212,17 @@ class VectorQuantizer2(nn.Module):
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
-    def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
+    def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor, content_idxBI: List[torch.Tensor]) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
+        # Change to add new content images embedding to the current f_hat, and return the next step's input for the next resolution scale.
+        B = f_hat.shape[0]
+        content_h_BChw = self.embedding(content_idxBI[si].view(B, self.v_patch_nums[si], self.v_patch_nums[si])).permute(0, 3, 1, 2).contiguous()
         HW = self.v_patch_nums[-1]
         if si != SN-1:
-            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample
+            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw + content_h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample: BxCxHW
             f_hat.add_(h)
             return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
         else:
-            h = self.quant_resi[si/(SN-1)](h_BChw)
+            h = self.quant_resi[si/(SN-1)](h_BChw + content_h_BChw)
             f_hat.add_(h)
             return f_hat, f_hat
 
@@ -199,10 +230,13 @@ class VectorQuantizer2(nn.Module):
 class Phi(nn.Conv2d):
     def __init__(self, embed_dim, quant_resi):
         ks = 3
+
+        # Kernel Size: 3, Inherit the normal Conv2D Block with embedding dimension of the embedding matrix.
         super().__init__(in_channels=embed_dim, out_channels=embed_dim, kernel_size=ks, stride=1, padding=ks//2)
-        self.resi_ratio = abs(quant_resi)
+        self.resi_ratio = abs(quant_resi) 
     
     def forward(self, h_BChw):
+        # Residual Convolutional with weight: h_BChw.(alpha) + Conv2D_3x3(1-alpha).
         return h_BChw.mul(1-self.resi_ratio) + super().forward(h_BChw).mul_(self.resi_ratio)
 
 

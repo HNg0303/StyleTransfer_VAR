@@ -62,16 +62,19 @@ class VQVAE(nn.Module):
     def fhat_to_img(self, f_hat: torch.Tensor):
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
     
-    def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
+    def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None, to_fhat: bool = False) -> List[torch.LongTensor]:    # return List[Bl]
         f = self.quant_conv(self.encoder(inp_img_no_grad))
-        return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
+        return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=to_fhat, v_patch_nums=v_patch_nums) # Return List of tensors of either reconstructed feature maps (f_hat) or indices (idx_Bl) for each resolution scale, depending on the boolean value of to_fhat.
     
     def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], same_shape: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
+        # ms_indx_Bl: List of tensors of shape (B, ph*pw) for each resolution scale, where ph and pw are the height and width of the feature map at that scale.
+        # same_shape: if True, all output images will have the same shape as the input image; if False, output images will have different shapes based on the resolution scale.
         B = ms_idx_Bl[0].shape[0]
         ms_h_BChw = []
         for idx_Bl in ms_idx_Bl:
             l = idx_Bl.shape[1]
             pn = round(l ** 0.5)
+            # Embedding must take in B x L, where L = ph*pw, and output B x L x C and then transpose to B x C x L and view to B x C x pn x pn. So we need to reshape idx_Bl to (B, ph*pw) before embedding.
             ms_h_BChw.append(self.quantize.embedding(idx_Bl).transpose(1, 2).view(B, self.Cvae, pn, pn))
         return self.embed_to_img(ms_h_BChw=ms_h_BChw, all_to_max_scale=same_shape, last_one=last_one)
     
