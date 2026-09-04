@@ -20,3 +20,4 @@ local_output*
 *.ipynb
 data/
 model_dir/
+results/

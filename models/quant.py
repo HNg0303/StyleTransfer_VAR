@@ -212,17 +212,19 @@ class VectorQuantizer2(nn.Module):
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
-    def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor, content_idxBI: List[torch.Tensor]) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
+    def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor, content_idxBI: Optional[List[torch.Tensor]] = None) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
         # Change to add new content images embedding to the current f_hat, and return the next step's input for the next resolution scale.
-        B = f_hat.shape[0]
-        content_h_BChw = self.embedding(content_idxBI[si].view(B, self.v_patch_nums[si], self.v_patch_nums[si])).permute(0, 3, 1, 2).contiguous()
+        if content_idxBI is not None:
+            B = f_hat.shape[0]
+            content_h_BChw = self.embedding(content_idxBI[si].view(B, self.v_patch_nums[si], self.v_patch_nums[si])).permute(0, 3, 1, 2).contiguous()
+            h_BChw = h_BChw + content_h_BChw
         HW = self.v_patch_nums[-1]
         if si != SN-1:
-            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw + content_h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample: BxCxHW
+            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample: BxCxHW
             f_hat.add_(h)
             return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
         else:
-            h = self.quant_resi[si/(SN-1)](h_BChw + content_h_BChw)
+            h = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h)
             return f_hat, f_hat
 
